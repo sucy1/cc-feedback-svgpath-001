@@ -1,0 +1,4 @@
+source: https://github.com/regebro/svg.path
+commit: e63fb851a0bba51bf76f3006ef0d49913d93e7bf
+license: MIT
+imported: 2026-11-15
