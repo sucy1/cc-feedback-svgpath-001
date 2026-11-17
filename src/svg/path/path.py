@@ -1,6 +1,6 @@
 from __future__ import annotations
-from math import sqrt, cos, sin, acos, degrees, radians, log, pi
-from typing import overload, Iterable, List, Tuple, Union, TYPE_CHECKING
+from math import sqrt, cos, sin, acos, atan2, degrees, radians, log, pi
+from typing import overload, Iterable, List, Sequence, Tuple, Union, TYPE_CHECKING
 from bisect import bisect
 from abc import ABC, abstractmethod
 import math
@@ -12,6 +12,143 @@ from collections.abc import MutableSequence
 
 MIN_DEPTH = 5
 ERROR = 1e-12
+
+# Type alias for a 2x3 affine matrix (a, b, c, d, e, f) as used by SVG:
+#     x' = a * x + c * y + e
+#     y' = b * x + d * y + f
+AffineMatrix = Sequence[float]
+
+
+def _transform_point(matrix: AffineMatrix, point: complex) -> complex:
+    """Apply a 2x3 affine matrix to a point given as a complex number."""
+    a, b, c, d, e, f = matrix
+    x, y = point.real, point.imag
+    return complex(a * x + c * y + e, b * x + d * y + f)
+
+
+def _transform_arc(matrix: AffineMatrix, segment: Arc) -> Arc:
+    """Transform an Arc segment by a 2x3 affine matrix.
+
+    An affine transform maps an ellipse to another ellipse, but the new
+    ellipse in general has different radii and a different rotation than
+    the old one (a non-uniform scale both squeezes and re-orients it), so
+    the new parameters are derived from the transformed ellipse matrix.
+    """
+    a, b, c, d, e, f = matrix
+    start = _transform_point(matrix, segment.start)
+    end = _transform_point(matrix, segment.end)
+
+    if segment.start == segment.end or not (
+        segment.radius.real and segment.radius.imag
+    ):
+        # Degenerate arcs (a point, or a straight line in disguise) carry no
+        # ellipse to transform.
+        return Arc(
+            start,
+            segment.radius,
+            segment.rotation,
+            segment.arc,
+            segment.sweep,
+            end,
+            relative=segment.relative,
+        )
+
+    # The ellipse is the image of the unit circle under
+    #     E = R(rotation) . S(rx, ry)
+    # After the affine map A the ellipse is the image under B = A . E.
+    rx = segment.radius.real * segment.radius_scale
+    ry = segment.radius.imag * segment.radius_scale
+    cosr = cos(radians(segment.rotation))
+    sinr = sin(radians(segment.rotation))
+
+    b00 = (a * cosr + c * sinr) * rx
+    b01 = (-a * sinr + c * cosr) * ry
+    b10 = (b * cosr + d * sinr) * rx
+    b11 = (-b * sinr + d * cosr) * ry
+
+    # The new radii are the singular values of B, the new rotation is the
+    # direction of the major axis, i.e. the first eigenvector of B . Bᵀ.
+    trace = b00 * b00 + b01 * b01 + b10 * b10 + b11 * b11
+    det = b00 * b11 - b01 * b10
+    discriminant = sqrt(max(trace * trace - 4 * det * det, 0.0))
+    new_rx = sqrt((trace + discriminant) / 2)
+    new_ry = sqrt((trace - discriminant) / 2)
+
+    m00 = b00 * b00 + b01 * b01
+    m01 = b00 * b10 + b01 * b11
+    m11 = b10 * b10 + b11 * b11
+    new_rotation = degrees(atan2(2 * m01, m00 - m11)) / 2
+
+    # A reflection (negative determinant) reverses the winding direction.
+    sweep = segment.sweep if a * d - b * c >= 0 else not segment.sweep
+
+    return Arc(
+        start,
+        complex(new_rx, new_ry),
+        new_rotation,
+        segment.arc,
+        sweep,
+        end,
+        relative=segment.relative,
+    )
+
+
+def _flatten_segment(
+    segment: NonLinear, tolerance: float, max_depth: int = 32
+) -> List[complex]:
+    """Approximate a curve with line segments within a chord-height tolerance.
+
+    Returns the list of points, including both the start and end points.
+    """
+    points = [segment.start]
+    _subdivide(
+        segment, 0.0, 1.0, segment.start, segment.end, tolerance, max_depth, 0, points
+    )
+    points.append(segment.end)
+    return points
+
+
+def _subdivide(
+    segment: NonLinear,
+    t0: float,
+    t1: float,
+    p0: complex,
+    p1: complex,
+    tolerance: float,
+    max_depth: int,
+    depth: int,
+    points: List[complex],
+) -> None:
+    """Recursively append the midpoints of the curve between t0 and t1 (in
+    order) until every chord stays within `tolerance` of the curve."""
+    chord = p1 - p0
+    chord_length = abs(chord)
+
+    # Measure the deviation of the curve from the chord at three sample
+    # points; sampling only the midpoint would miss S-shaped curves.
+    flat = True
+    for t in (0.25, 0.5, 0.75):
+        point = segment.point(t0 + (t1 - t0) * t)
+        if chord_length < ERROR:
+            deviation = abs(point - p0)
+        else:
+            # Distance from the point to the chord line.
+            deviation = (
+                abs((point - p0).imag * chord.real - (point - p0).real * chord.imag)
+                / chord_length
+            )
+        if deviation > tolerance:
+            flat = False
+            break
+
+    if flat or depth >= max_depth:
+        return
+
+    mid = (t0 + t1) / 2
+    mid_point = segment.point(mid)
+    _subdivide(segment, t0, mid, p0, mid_point, tolerance, max_depth, depth + 1, points)
+    points.append(mid_point)
+    _subdivide(segment, mid, t1, mid_point, p1, tolerance, max_depth, depth + 1, points)
 
 
 def _find_solutions_for_bezier(c2: float, c1: float, c0: float) -> List[float]:
@@ -1032,3 +1169,135 @@ class Path(PathType):
         x_min, x_max = min(x_coords), max(x_coords)
         y_min, y_max = min(y_coords), max(y_coords)
         return [x_min, y_min, x_max, y_max]
+
+    def transform(self, matrix: AffineMatrix) -> Path:
+        """Return a new Path transformed by a 2x3 affine matrix.
+
+        The matrix is a sequence of six values (a, b, c, d, e, f) mapping
+        points as in SVG:
+            x' = a * x + c * y + e
+            y' = b * x + d * y + f
+
+        Lines, quadratic and cubic Béziers are transformed through their
+        control points (affine maps preserve Bézier curves). Arcs are
+        re-parameterized: under a non-uniform scale the radii and the
+        rotation of the ellipse change, and a reflection (negative
+        determinant) flips the sweep flag.
+        """
+        if len(matrix) != 6:
+            raise ValueError(
+                "Expected a 2x3 affine matrix as 6 values (a, b, c, d, e, f)"
+            )
+
+        segments: List[PathSegment] = []
+        for segment in self._segments:
+            if isinstance(segment, Arc):
+                segments.append(_transform_arc(matrix, segment))
+            elif isinstance(segment, Move):
+                segments.append(
+                    Move(
+                        _transform_point(matrix, segment.end),
+                        relative=segment.relative,
+                    )
+                )
+            elif isinstance(segment, Close):
+                segments.append(
+                    Close(
+                        _transform_point(matrix, segment.start),
+                        _transform_point(matrix, segment.end),
+                        relative=segment.relative,
+                    )
+                )
+            elif isinstance(segment, Line):
+                segments.append(
+                    Line(
+                        _transform_point(matrix, segment.start),
+                        _transform_point(matrix, segment.end),
+                        relative=segment.relative,
+                        vertical=segment.vertical,
+                        horizontal=segment.horizontal,
+                    )
+                )
+            elif isinstance(segment, CubicBezier):
+                segments.append(
+                    CubicBezier(
+                        _transform_point(matrix, segment.start),
+                        _transform_point(matrix, segment.control1),
+                        _transform_point(matrix, segment.control2),
+                        _transform_point(matrix, segment.end),
+                        relative=segment.relative,
+                        smooth=segment.smooth,
+                    )
+                )
+            elif isinstance(segment, QuadraticBezier):
+                segments.append(
+                    QuadraticBezier(
+                        _transform_point(matrix, segment.start),
+                        _transform_point(matrix, segment.control),
+                        _transform_point(matrix, segment.end),
+                        relative=segment.relative,
+                        smooth=segment.smooth,
+                    )
+                )
+            else:
+                raise TypeError(f"Unsupported segment type: {type(segment)}")
+        return Path(*segments)
+
+    def is_closed(self, tolerance: float = 1e-6) -> bool:
+        """Check whether the (last) subpath is closed.
+
+        A subpath is closed if it ends with a Close segment, or if its last
+        point coincides with its starting point within `tolerance`.
+        """
+        if not self._segments:
+            return False
+
+        last = self._segments[-1]
+        if isinstance(last, Close):
+            return True
+
+        # Find the start of the current (last) subpath. After a Close the
+        # pen is back at the subpath start, so a Close also (re)sets it.
+        subpath_start = self._segments[0].start
+        for segment in self._segments:
+            if isinstance(segment, (Move, Close)):
+                subpath_start = segment.end
+
+        return abs(last.end - subpath_start) <= tolerance
+
+    def flatten(self, tolerance: float = 0.1) -> List[List[complex]]:
+        """Approximate the path with polylines, one point list per subpath.
+
+        Curves (arcs and Béziers) are recursively subdivided until the
+        chord-height (sagitta) error of every line segment is at most
+        `tolerance`. Lines and Close segments are already flat and only
+        contribute their endpoints. Returns a list of point lists, one per
+        subpath; each point is a complex number.
+        """
+        subpaths: List[List[complex]] = []
+        current: Union[List[complex], None] = None
+
+        for segment in self._segments:
+            if isinstance(segment, Move):
+                current = [segment.end]
+                subpaths.append(current)
+                continue
+
+            if current is None:
+                # A drawing segment without a preceding Move starts a new
+                # subpath at its own start point.
+                current = [segment.start]
+                subpaths.append(current)
+
+            if isinstance(segment, NonLinear):
+                points = _flatten_segment(segment, tolerance)
+                current.extend(points[1:])
+            else:
+                current.append(segment.end)
+
+            if isinstance(segment, Close):
+                # Anything following a Close (without a Move) belongs to a
+                # new subpath.
+                current = None
+
+        return subpaths
