@@ -4,7 +4,23 @@ Changelog
 7.2 (unreleased)
 ----------------
 
-- Nothing changed yet.
+- Added ``Path.transform(matrix)``, which returns a new Path transformed by
+  a 2x3 affine matrix. Lines and Bezier curves are transformed through their
+  control points, while Arc segments are re-parameterized as elliptical
+  arcs: non-uniform scaling and shearing change both the radii and the
+  rotation, and mirroring (a negative determinant) flips the sweep flag.
+
+- Added ``Path.is_closed(tolerance=1e-6)``, which reports whether the path's
+  start and end points coincide, taking Close segments and an endpoint
+  tolerance into account. Empty paths and Move-only paths are open.
+
+- Added ``Path.flatten(tolerance=0.1)``, which approximates the path with
+  polylines grouped by subpath. Arc, QuadraticBezier and CubicBezier
+  segments are subdivided until their chord-height error is within the
+  tolerance. The flatness tests use the distance to the finite chord
+  segment (not the infinite supporting line) so S-shaped curves, control
+  points that overshoot a chord endpoint, and highly eccentric elliptical
+  arcs are all subdivided correctly.
 
 
 7.1 (2026-07-07)

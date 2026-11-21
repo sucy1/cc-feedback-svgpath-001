@@ -13,6 +13,319 @@ from collections.abc import MutableSequence
 MIN_DEPTH = 5
 ERROR = 1e-12
 
+# Maximum recursion depth used when flattening curves to polylines.
+MAX_FLATTEN_DEPTH = 16
+
+# A 2x3 affine matrix, given in SVG matrix() order:
+# x' = a*x + c*y + e
+# y' = b*x + d*y + f
+AffineMatrix = Tuple[float, float, float, float, float, float]
+
+
+def _apply_matrix(matrix: AffineMatrix, point: complex) -> complex:
+    a, b, c, d, e, f = matrix
+    return complex(
+        a * point.real + c * point.imag + e,
+        b * point.real + d * point.imag + f,
+    )
+
+
+def _transform_arc(segment: "Arc", matrix: AffineMatrix) -> PathSegment:
+    """Transform an Arc by an affine matrix.
+
+    Under a general affine transform an ellipse stays an ellipse, but its
+    radii and rotation change. The ellipse is parameterized as
+
+        P(t) = center + R(rotation) * diag(rx, ry) * (cos t, sin t)
+
+    so the transformed ellipse is governed by M = A * R * diag(rx, ry),
+    where A is the linear part of the matrix. Decomposing M via the
+    eigen-decomposition of the symmetric matrix Mt*M (a 2x2 SVD) gives the
+    new radii as the singular values and the new rotation from the
+    eigenvectors. A negative determinant mirrors the ellipse, which flips
+    the sweep flag; the large-arc flag is preserved.
+    """
+    start = _apply_matrix(matrix, segment.start)
+    end = _apply_matrix(matrix, segment.end)
+
+    radius_scale = getattr(segment, "radius_scale", 1)
+    rx = segment.radius.real * radius_scale
+    ry = segment.radius.imag * radius_scale
+
+    if segment.start == segment.end or rx == 0 or ry == 0:
+        # Degenerate arcs are equivalent to a line (or nothing); the
+        # rotation and radii carry no geometry, so keep them as is.
+        return Arc(
+            start,
+            segment.radius,
+            segment.rotation,
+            segment.arc,
+            segment.sweep,
+            end,
+        )
+
+    a, b, c, d, _, _ = matrix
+    phi = radians(segment.rotation)
+    cosr = cos(phi)
+    sinr = sin(phi)
+
+    # M = A * R(phi) * diag(rx, ry)
+    m00 = rx * (a * cosr + c * sinr)
+    m01 = ry * (-a * sinr + c * cosr)
+    m10 = rx * (b * cosr + d * sinr)
+    m11 = ry * (-b * sinr + d * cosr)
+
+    # S = Mt * M (symmetric); its eigenvalues are the squared singular values.
+    s00 = m00 * m00 + m10 * m10
+    s01 = m00 * m01 + m10 * m11
+    s11 = m01 * m01 + m11 * m11
+
+    trace = s00 + s11
+    spread = sqrt(max((s00 - s11) ** 2 / 4 + s01 * s01, 0.0))
+    new_rx = sqrt(max(trace / 2 + spread, 0.0))
+    new_ry = sqrt(max(trace / 2 - spread, 0.0))
+
+    if new_rx < ERROR or new_ry < ERROR:
+        # The transform collapses the ellipse to (at most) a line.
+        return Line(start, end)
+
+    # Eigenvector of S for the largest eigenvalue, mapped through M and
+    # normalized, gives the major axis direction of the transformed ellipse.
+    theta_v = 0.5 * math.atan2(2 * s01, s00 - s11)
+    v1x = cos(theta_v)
+    v1y = sin(theta_v)
+    new_rotation = (
+        degrees(
+            math.atan2(
+                (m10 * v1x + m11 * v1y) / new_rx,
+                (m00 * v1x + m01 * v1y) / new_rx,
+            )
+        )
+        % 360
+    )
+
+    sweep = segment.sweep
+    if a * d - b * c < 0:
+        # Mirroring reverses the winding direction.
+        sweep = not sweep
+
+    return Arc(start, complex(new_rx, new_ry), new_rotation, segment.arc, sweep, end)
+
+
+def _transform_segment(segment: PathSegment, matrix: AffineMatrix) -> PathSegment:
+    """Transform a single segment, returning a new absolute segment."""
+    if isinstance(segment, Move):
+        return Move(_apply_matrix(matrix, segment.end))
+    if isinstance(segment, Close):
+        return Close(
+            _apply_matrix(matrix, segment.start),
+            _apply_matrix(matrix, segment.end),
+        )
+    if isinstance(segment, Line):
+        return Line(
+            _apply_matrix(matrix, segment.start),
+            _apply_matrix(matrix, segment.end),
+        )
+    if isinstance(segment, CubicBezier):
+        return CubicBezier(
+            _apply_matrix(matrix, segment.start),
+            _apply_matrix(matrix, segment.control1),
+            _apply_matrix(matrix, segment.control2),
+            _apply_matrix(matrix, segment.end),
+        )
+    if isinstance(segment, QuadraticBezier):
+        return QuadraticBezier(
+            _apply_matrix(matrix, segment.start),
+            _apply_matrix(matrix, segment.control),
+            _apply_matrix(matrix, segment.end),
+        )
+    if isinstance(segment, Arc):
+        return _transform_arc(segment, matrix)
+    raise TypeError(f"Unsupported segment type: {type(segment)!r}")
+
+
+def _distance_to_segment(
+    point: complex, line_start: complex, line_end: complex
+) -> float:
+    """Distance from point to the finite segment between line_start/end.
+
+    Unlike the distance to the infinite supporting line, this also accounts
+    for the point projecting beyond an endpoint, which is what bounds the
+    flattening error of a Bezier piece against its endpoint chord.
+    """
+    chord = line_end - line_start
+    chord_length = abs(chord)
+    if chord_length == 0:
+        return abs(point - line_start)
+    projection = (
+        (point - line_start).real * chord.real + (point - line_start).imag * chord.imag
+    ) / chord_length**2
+    projection = min(1.0, max(0.0, projection))
+    nearest = line_start + chord * projection
+    return abs(point - nearest)
+
+
+def _bezier_is_flat(
+    segment: NonLinear, start: complex, end: complex, tolerance: float
+) -> bool:
+    """Chord-height flatness test for Bezier curves.
+
+    A Bezier curve is contained in the convex hull of its control points, so
+    the distance of every off-curve control point from the endpoint chord
+    segment bounds the curve's deviation from the approximating line. The
+    distance to the finite segment (not the infinite supporting line) is used
+    because a control point that overshoots an endpoint along the chord
+    direction would otherwise pass a perpendicular-distance test while the
+    curve still bulges past that endpoint.
+
+    Checking all control points (rather than only the midpoint) also catches
+    curves with an inflection, such as an S-shaped cubic whose midpoint lies
+    on the chord while the control points are far away from it.
+    """
+    if isinstance(segment, CubicBezier):
+        controls: Tuple[complex, ...] = (segment.control1, segment.control2)
+    else:
+        assert isinstance(segment, QuadraticBezier)
+        controls = (segment.control,)
+    return all(
+        _distance_to_segment(control, start, end) <= tolerance for control in controls
+    )
+
+
+# Number of samples used when measuring an arc piece's maximum distance to
+# its chord segment. Together with the 90-degree angular span cap this keeps
+# the measurement accurate even for highly eccentric ellipses.
+ARC_FLATNESS_SAMPLES = 16
+
+
+def _arc_max_distance_to_segment(
+    segment: "Arc", t0: float, t1: float, p0: complex, p1: complex
+) -> float:
+    """Maximum distance from the arc piece on [t0, t1] to its endpoint
+    chord *segment*.
+
+    For an eccentric ellipse the point furthest from the chord can project
+    beyond a chord endpoint (so the answer is an endpoint distance, not the
+    perpendicular distance to the chord's line), and need not sit at the
+    parameter midpoint. The piece is sampled densely; the angular-span cap in
+    _flatten_arc() bounds how much geometry each accepted piece covers, which
+    keeps this sampling reliably inside the tolerance.
+    """
+    chord = p1 - p0
+    chord_length = abs(chord)
+    if chord_length == 0:
+        return max(abs(segment.point((t0 + t1) / 2) - p0), abs(p1 - p0))
+
+    radius = segment.radius * segment.radius_scale
+    if radius.real == 0 or radius.imag == 0:
+        # A straight-line arc lies on the chord.
+        return 0.0
+
+    chord_sq = chord_length**2
+
+    def distance_of(point: complex) -> float:
+        projection = (
+            (point - p0).real * chord.real + (point - p0).imag * chord.imag
+        ) / chord_sq
+        if 0.0 <= projection <= 1.0:
+            nearest = p0 + chord * projection
+        else:
+            nearest = p0 if projection < 0.0 else p1
+        return abs(point - nearest)
+
+    result = max(distance_of(p0), distance_of(p1))
+    for i in range(1, ARC_FLATNESS_SAMPLES):
+        result = max(
+            result,
+            distance_of(segment.point(t0 + (t1 - t0) * i / ARC_FLATNESS_SAMPLES)),
+        )
+    return result
+
+
+def _flatten_arc(
+    segment: "Arc",
+    tolerance: float,
+    out: List[complex],
+    t0: float = 0.0,
+    t1: float = 1.0,
+    p0: Union[complex, None] = None,
+    p1: Union[complex, None] = None,
+    depth: int = 0,
+) -> None:
+    """Recursively subdivide an arc in parameter space, appending the end
+    points of the flat pieces to out. A piece is accepted only once its
+    maximum distance to the endpoint chord segment (measured by dense
+    sampling) is within tolerance, and once its angular span is at most a
+    quarter turn, which bounds the number of pieces on a full circle.
+    """
+    if p0 is None:
+        p0 = segment.point(t0)
+    if p1 is None:
+        p1 = segment.point(t1)
+    # Degenerate arcs (coincident endpoints, or a zero radius) behave as a
+    # straight line / no-op and carry no parameterized center or delta.
+    if segment.start == segment.end or (
+        segment.radius.real == 0 or segment.radius.imag == 0
+    ):
+        out.append(p1)
+        return
+    span = abs(radians(segment.delta)) * (t1 - t0)
+    span_ok = span <= pi / 2
+    flat_ok = _arc_max_distance_to_segment(segment, t0, t1, p0, p1) <= tolerance
+    if depth >= MAX_FLATTEN_DEPTH or (span_ok and flat_ok):
+        out.append(p1)
+        return
+    tm = (t0 + t1) / 2
+    pm = segment.point(tm)
+    _flatten_arc(segment, tolerance, out, t0, tm, p0, pm, depth + 1)
+    _flatten_arc(segment, tolerance, out, tm, t1, pm, p1, depth + 1)
+
+
+def _flatten_bezier(
+    segment: NonLinear,
+    tolerance: float,
+    out: List[complex],
+    depth: int = 0,
+) -> None:
+    """Recursively subdivide a Bezier curve in control-point space
+    (de Casteljau's algorithm) until the control points lie within
+    tolerance of the endpoint chord, then treat the piece as a straight
+    line and append its end point.
+
+    Subdividing geometrically rather than at a fixed parameter midpoint
+    keeps the pieces balanced even for S-shaped curves: a parameter
+    midpoint can land exactly on the chord while the control points are
+    still far away from it, which would force the recursion down to the
+    depth limit.
+    """
+    start = segment.start
+    end = segment.end
+    if depth >= MAX_FLATTEN_DEPTH or _bezier_is_flat(segment, start, end, tolerance):
+        out.append(end)
+        return
+
+    if isinstance(segment, CubicBezier):
+        p0, p1, p2, p3 = segment.start, segment.control1, segment.control2, segment.end
+        m01 = (p0 + p1) / 2
+        m12 = (p1 + p2) / 2
+        m23 = (p2 + p3) / 2
+        m012 = (m01 + m12) / 2
+        m123 = (m12 + m23) / 2
+        midpoint = (m012 + m123) / 2
+        first_half: NonLinear = CubicBezier(p0, m01, m012, midpoint)
+        second_half: NonLinear = CubicBezier(midpoint, m123, m23, p3)
+    else:
+        assert isinstance(segment, QuadraticBezier)
+        p0, p1, p2 = segment.start, segment.control, segment.end
+        m01 = (p0 + p1) / 2
+        m12 = (p1 + p2) / 2
+        midpoint = (m01 + m12) / 2
+        first_half = QuadraticBezier(p0, m01, midpoint)
+        second_half = QuadraticBezier(midpoint, m12, p2)
+
+    _flatten_bezier(first_half, tolerance, out, depth + 1)
+    _flatten_bezier(second_half, tolerance, out, depth + 1)
+
 
 def _find_solutions_for_bezier(c2: float, c1: float, c0: float) -> List[float]:
     """Find solutions of c2 * t^2 + c1 * t + c0 = 0 where t in [0, 1]"""
@@ -1032,3 +1345,96 @@ class Path(PathType):
         x_min, x_max = min(x_coords), max(x_coords)
         y_min, y_max = min(y_coords), max(y_coords)
         return [x_min, y_min, x_max, y_max]
+
+    def transform(self, matrix: AffineMatrix) -> Path:
+        """Returns a new Path transformed by a 2x3 affine matrix.
+
+        The matrix is a 6-tuple (a, b, c, d, e, f) in SVG matrix() order:
+
+            x' = a*x + c*y + e
+            y' = b*x + d*y + f
+
+        Lines and Bezier curves are transformed through their control
+        points. Arcs are re-parameterized as elliptical arcs: under
+        non-uniform scaling or shearing both the radii and the rotation
+        change, and mirroring (negative determinant) flips the sweep flag.
+
+        The returned path uses absolute, non-smooth segments, since
+        relative coordinates and smooth/horizontal/vertical shorthands are
+        not preserved by general affine transforms. The result round-trips
+        through d() and parse_path().
+        """
+        a, b, c, d, e, f = matrix
+        return Path(
+            *[
+                _transform_segment(segment, (a, b, c, d, e, f))
+                for segment in self._segments
+            ]
+        )
+
+    def is_closed(self, tolerance: float = 1e-6) -> bool:
+        """Returns True if the path's start and end points coincide.
+
+        A path that ends in a Close segment is closed by definition.
+        Otherwise the distance between the first segment's start and the
+        last segment's end is compared against the tolerance. An empty
+        path and a path that only contains Move commands have no drawn
+        geometry and are considered open.
+        """
+        # Only Move commands (or nothing at all): no drawn geometry.
+        if not self._segments or all(
+            isinstance(segment, Move) for segment in self._segments
+        ):
+            return False
+        if isinstance(self._segments[-1], Close):
+            return True
+        return abs(self._segments[0].start - self._segments[-1].end) <= tolerance
+
+    def flatten(self, tolerance: float = 0.1) -> List[List[complex]]:
+        """Approximates the path with polylines, grouped by subpath.
+
+        Curves (Arc, QuadraticBezier and CubicBezier) are recursively
+        subdivided until the chord-height (sagitta) error is within the
+        tolerance. Returns a list of subpaths, each a list of complex
+        points. A new subpath starts at every Move segment and at every
+        discontinuity; a Close segment appends the subpath's start point,
+        explicitly closing the polygon.
+        """
+        subpaths: List[List[complex]] = []
+        current: List[complex] = []
+        # Subpath connectivity is judged from the segments' declared
+        # endpoints, not from the evaluated curve points, which carry
+        # floating point round-off (an arc's evaluated end can differ from
+        # its stored endpoint by ~1e-7 even on a continuous path).
+        previous_end: Union[complex, None] = None
+        for segment in self._segments:
+            if isinstance(segment, Move):
+                if current:
+                    subpaths.append(current)
+                current = [segment.end]
+                previous_end = segment.end
+                continue
+            if not current:
+                current = [segment.start]
+            elif previous_end is None or segment.start != previous_end:
+                # Discontinuous declared geometry: start a new subpath.
+                subpaths.append(current)
+                current = [segment.start]
+            if isinstance(segment, Arc):
+                _flatten_arc(segment, tolerance, current)
+            elif isinstance(segment, NonLinear):
+                _flatten_bezier(segment, tolerance, current)
+            elif isinstance(segment, Close):
+                # A Close returns to the subpath's starting point. Using
+                # that point (rather than the Close's stored end) keeps the
+                # polygon closed and the closing segment inside the same
+                # subpath even when preceding curves accumulated round-off.
+                current.append(current[0])
+                previous_end = current[0]
+                continue
+            else:
+                current.append(segment.end)
+            previous_end = segment.end
+        if current:
+            subpaths.append(current)
+        return subpaths
